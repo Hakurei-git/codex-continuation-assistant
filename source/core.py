@@ -121,7 +121,7 @@ def evaluate(state, snap, now, retry_seconds=None):
         if key in state['handled']:
             return 'wait', '该请求已答复'
         scope = safe_approval(question)
-        if state['approval'] and scope:
+        if state['approval'] and scope and not snap.get('control_stopped'):
             return 'approve', scope
         return 'attention', '等待你在原对话审核，仍在监测；审核后自动重新核验，无需重新绑定'
     if snap.get('turn_status') == 'failed':

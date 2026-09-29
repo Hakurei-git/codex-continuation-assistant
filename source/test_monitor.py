@@ -200,6 +200,49 @@ class WorkerTests(unittest.TestCase):
         app.load()
         self.assertTrue((app.DATA / 'paused').exists())
 
+    def test_manual_continue_restarts_stopped_monitor(self):
+        s=app.state_for(self.config);s.update(stopped=True,last_check=100,reason='检测到用户主动停止；请明确恢复后重新开始监测')
+        with patch.object(app,'snapshot',return_value=snapshot(resume_at=101,running=True)):
+            result=app.tick(self.config,self.bridge,tid='target')
+        self.assertFalse(result['state']['stopped'])
+        self.assertEqual(self.calls,[])
+
+    def test_continue_does_not_lift_control_stop(self):
+        s=app.state_for(self.config);s.update(stopped=True,stopped_at=100,stop_kind='manual')
+        with patch.object(app,'snapshot',return_value=snapshot(resume_at=101,control_stop_at=90,control_stopped=True,manual_stop=False)):
+            result=app.tick(self.config,self.bridge,tid='target')
+        self.assertFalse(result['state']['stopped'])
+        self.assertIn('等待退避时间',result['reason'])
+        self.assertEqual(self.calls,[])
+
+    def test_control_stop_does_not_block_running_chat(self):
+        with patch.object(app,'snapshot',return_value=snapshot(control_stopped=True,running=True)):
+            result=app.tick(self.config,self.bridge,tid='target')
+        self.assertIn('正在执行',result['reason'])
+        self.assertFalse(result['notify'])
+        self.assertEqual(self.calls,[])
+
+    def test_retry_carries_control_restriction(self):
+        self.ready()
+        with patch.object(app,'snapshot',return_value=snapshot(control_stopped=True)):
+            app.tick(self.config,self.bridge)
+        self.assertEqual(len(self.calls),1)
+        self.assertIn('不得调用电脑控制工具',self.calls[0][1]['prompt'])
+
+    def test_control_stop_never_automatically_approves(self):
+        s=new_state();s['approval']=True
+        q=snapshot(control_stopped=True,turn_status='completed',question='是否允许在当前项目中运行一次定向测试？',question_id='q')
+        self.assertEqual(evaluate(s,q,100)[0],'attention')
+
+    def test_old_continue_global_pause_and_other_stops_remain_stopped(self):
+        for kind,resume,global_pause in [('manual',99,False),('other',101,False),('manual',101,True)]:
+            s=app.state_for(self.config);s.update(stopped=True,stopped_at=100,stop_kind=kind,reason='停止')
+            if global_pause:app.pause()
+            with patch.object(app,'snapshot',return_value=snapshot(resume_at=resume)):
+                result=app.tick(self.config,self.bridge,tid='target')
+            self.assertTrue(result['state']['stopped'])
+            self.assertEqual(self.calls,[])
+
     def test_send_is_ledgered_before_dispatch(self):
         self.ready()
         with patch.object(app, 'snapshot', return_value=snapshot()):
@@ -377,6 +420,21 @@ class WorkerTests(unittest.TestCase):
 
 
 class ContextTests(unittest.TestCase):
+    def test_control_stop_ignores_assistant_and_quoted_logs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'history.jsonl'
+            sentinel='Computer Use was stopped by the user with the physical Escape key. Stop your work, do not call further tools'
+            rows=[{'type':'response_item','timestamp':'2026-09-29T01:00:00Z','payload':{'type':'message','role':'assistant','content':[{'text':'解释实体 Esc 停止接管。'+sentinel}]}},
+                  {'type':'response_item','timestamp':'2026-09-29T01:01:00Z','payload':{'type':'custom_tool_call_output','output':json.dumps({'quoted':sentinel})}}]
+            path.write_text(''.join(json.dumps(r)+'\n' for r in rows),encoding='utf-8')
+            self.assertEqual(app.history_control_stop(path),(False,0))
+            rows.append({'type':'response_item','timestamp':'2026-09-29T01:02:00Z','payload':{'type':'custom_tool_call_output','output':[{'type':'input_text','text':'Script completed'},{'type':'input_text','text':sentinel}]}})
+            path.write_text(''.join(json.dumps(r)+'\n' for r in rows),encoding='utf-8')
+            self.assertTrue(app.history_control_stop(path)[0])
+            rows.append({'type':'response_item','timestamp':'2026-09-29T01:03:00Z','payload':{'type':'message','role':'user','content':[{'text':'恢复接管'}]}})
+            path.write_text(''.join(json.dumps(r)+'\n' for r in rows),encoding='utf-8')
+            self.assertFalse(app.history_control_stop(path)[0])
+
     def test_delegated_receipt_and_quoted_output_are_distinct(self):
         marker = '[自动续接助手:abc123]'
         with tempfile.TemporaryDirectory() as directory:

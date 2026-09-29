@@ -96,11 +96,10 @@ def snapshot(bridge, tid):
     progress = ''
     user_messages = []
     last_user_at = 0
-    stopped_control = False
+    resume_at = 0
+    stopped_control, control_stop_at = history_control_stop(row[1])
     for turn in reversed(read_turns):
         for item in turn.get('items', []):
-            if item.get('type') == 'agentMessage' and re.search(r'实体\s*Esc|电脑控制被.*中止|接管因.*停止|停止电脑控制', item.get('text', '')):
-                stopped_control = True
             if item.get('type') == 'commandExecution' and item.get('status') == 'completed' and item.get('exitCode') == 0:
                 progress = item['id']
             if item.get('type') == 'userMessage':
@@ -108,8 +107,8 @@ def snapshot(bridge, tid):
                 user_messages.append(user_text)
                 if '[自动续接助手:' not in user_text:
                     last_user_at = max(last_user_at, turn.get('startedAt') or 0)
-                if '[自动续接助手:' not in user_text and len(user_text) < 200 and re.search(r'恢复接管|正常接管|你接管吧|恢复控制', user_text):
-                    stopped_control = False
+                    if re.fullmatch(r'(?:继续(?:喵|吧)?|恢复监测|继续监测|恢复接管|正常接管|你接管吧|恢复控制)[。!！\s]*', user_text.strip()):
+                        resume_at = max(resume_at, turn.get('startedAt') or 0)
     question = question_id = ''
     latest_items = (latest_read or {}).get('items', [])
     for item in latest_items:
@@ -118,7 +117,7 @@ def snapshot(bridge, tid):
             if re.search(r'是否|允许|同意|确认|批准', text) and re.search(r'[?？]', text):
                 question, question_id = text, item['id']
     last_user = next((m for m in reversed(user_messages) if '[自动续接助手:' not in m), '')
-    manual_stop = stopped_control or (len(last_user) < 200 and bool(re.match(r'^(?:请)?(?:暂停|停下|停止|先别|不要继续|别继续)', last_user.strip())))
+    manual_stop = len(last_user) < 200 and bool(re.match(r'^(?:请)?(?:暂停|停下|停止|先别|不要继续|别继续)', last_user.strip()))
     status = poll.get('thread', {}).get('status', {})
     kind = status.get('type') if isinstance(status, dict) else status
     return {'exists': True, 'id': tid, 'title': read['thread'].get('title', tid),
@@ -129,7 +128,38 @@ def snapshot(bridge, tid):
             'error': json.dumps(latest.get('error') or {}, ensure_ascii=False),
             'progress': progress, 'manual_stop': manual_stop, 'message_text': '\n'.join(user_messages),
             'last_user_at': last_user_at,
+            'resume_at': resume_at, 'control_stopped': stopped_control, 'control_stop_at': control_stop_at,
             'question': question, 'question_id': question_id, 'history_path': row[1]}
+
+
+def history_control_stop(path):
+    """Recognize runtime interruption trailers, never assistant explanations."""
+    sentinel = 'Computer Use was stopped by the user with the physical Escape key.'
+    stopped_at = resumed_at = 0
+    with open(path, 'rb') as history:
+        for line in history:
+            if sentinel.encode() not in line and b'"role":"user"' not in line and b'"role": "user"' not in line:
+                continue
+            try:
+                record = json.loads(line)
+                at = datetime.datetime.fromisoformat(record['timestamp'].replace('Z', '+00:00')).timestamp()
+            except (ValueError, KeyError):
+                continue
+            p = record.get('payload', {})
+            if record.get('type') != 'response_item':
+                continue
+            output = p.get('output', '')
+            if isinstance(output, list):
+                output = '\n'.join(c.get('text', '') for c in output if isinstance(c, dict) and c.get('type') in ['input_text', 'text'])
+            if p.get('type') == 'custom_tool_call_output' and isinstance(output, str):
+                if re.search(r'(?m)^' + re.escape(sentinel) + r' Stop your work,', output):
+                    stopped_at = max(stopped_at, at)
+            if p.get('type') == 'message' and p.get('role') == 'user':
+                text = '\n'.join(c.get('text', '') for c in p.get('content', [])).strip()
+                if '[自动续接助手:' not in text and len(text) < 200 and not any(c in text for c in ['`', '>', '“', '”', '"']):
+                    if re.search(r'恢复接管|正常接管|你接管吧|恢复控制', text):
+                        resumed_at = max(resumed_at, at)
+    return stopped_at > resumed_at, stopped_at
 
 
 def history_receipt(path, pending):
@@ -201,6 +231,16 @@ def tick(config, bridge, dry=False, tid=None):
                 snap['message_text'] = snap.get('message_text', '') + state['pending']['marker']
         except OSError:
             pass  # Keep pending; a missing/unreadable history is not non-delivery.
+    if not dry and not (DATA / 'paused').exists() and state.get('stopped'):
+        manual_reason = state.get('stop_kind') == 'manual' or state.get('reason', '').startswith('检测到用户主动停止')
+        if manual_reason and snap.get('resume_at', 0) > state.get('stopped_at', state.get('last_check', 0)):
+            state['stopped'] = False
+            state['due'] = None
+            log('user resumed monitoring thread=' + tid)
+        elif state.get('stop_detection_version', 0) < 2 and state.get('reason', '').startswith('检测到用户主动停止') and not snap.get('manual_stop') and snap.get('turn_status') != 'interrupted':
+            state['stopped'] = False
+            state['due'] = None
+            log('stale manual-stop evidence cleared thread=' + tid)
     if dry or (DATA / 'paused').exists() or state.get('stopped'):
         return {'reason': state.get('reason') if state.get('stopped') else '监测已暂停（只读状态已更新）', 'snapshot': public(snap), 'state': state}
     action, reason = evaluate(state, snap, time.time(), config.get('retry_seconds', 30))
@@ -220,6 +260,8 @@ def tick(config, bridge, dry=False, tid=None):
             if action == 'retry':
                 task = '继续完成当前目标。' if snap.get('goal') else '继续当前对话中尚未完成的工作。'
                 message = task + '先核查当前进程、已有回执和实际进度；保留最新用户授权与安全边界，不重放一次性操作。若用户已暂停、工作已完成或需要新授权，不要据此继续操作。'
+                if second.get('control_stopped'):
+                    message += '电脑接管此前已被中止：本次只继续不涉及电脑接管的已授权工作，不得调用电脑控制工具或绕过中止限制；需要接管时请向用户明确请求恢复授权。'
             else:
                 message = ('同意本次在当前项目范围内' + reason2 + '。仅限可回滚的工作区操作；不得修改正式存档、删除数据、付费、扩大权限、关闭安全保护、突破一次性次数或恢复用户主动停止的接管。若实际操作超出此范围，请停止并向用户确认。')
             state['pending'] = {'marker': marker, 'created': time.time(), 'kind': 'retry' if action == 'retry' else 'approval', 'key': key}
@@ -237,6 +279,9 @@ def tick(config, bridge, dry=False, tid=None):
                 reason = '发送结果不明确，先核对记录；不会立即补发'
     if action == 'pause':
         state['stopped'] = True
+        state['stopped_at'] = time.time()
+        state['stop_detection_version'] = 2
+        state['stop_kind'] = 'manual' if snap.get('manual_stop') or snap.get('turn_status') == 'interrupted' else 'other'
         if not multi:
             pause()
     if state.get('reason') != reason:

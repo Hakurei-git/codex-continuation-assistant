@@ -1,6 +1,6 @@
 # Codex 自动续接助手 · 通用版
 
-[下载 Windows EXE](https://github.com/Hakurei-git/codex-continuation-assistant/releases/download/v2.1/CodexContinuationAssistant.exe) · [所有发布版本](https://github.com/Hakurei-git/codex-continuation-assistant/releases)
+[下载 EXE](https://github.com/Hakurei-git/codex-continuation-assistant/releases/download/v2.2/CodexContinuationAssistant.exe) · [发布版本](https://github.com/Hakurei-git/codex-continuation-assistant/releases)
 
 独立社区工具，非 OpenAI 官方产品。
 
@@ -55,8 +55,15 @@
 
 开发测试：python -m unittest discover -s source -p test_monitor.py -v
 
-打包前运行 `python -m pip install -r requirements-build.txt`，然后进入 `source` 目录。
+先安装 requirements-build.txt 中的构建依赖，再进入 source 目录。
 
 打包：python -m PyInstaller --noconfirm --onefile --windowed --name CodexContinuationAssistant --add-data "Window.ps1;." app.py
 
 实际测试结果见 TEST-RESULTS.md。跨机器兼容性仍取决于对方的 Codex 版本和本机环境。
+
+
+## v2.2 停止误判与监测状态修复
+
+停止检测只认明确用户指令和真实运行时中断，不匹配助手说明、引用或日志中的 Esc 字样。新的继续或继续喵可恢复因用户停止而暂停的聊天监测；全局暂停及重试耗尽仍保留。电脑接管中止与对话监测分开：执行中正常监测，临时失败正常续接；续接消息明确禁止恢复电脑控制，接管中止期间不自动回复审批。只有最新真实请求需要审核时才显示等待审核。
+
+不支持调用目标卡片的 Resume goal，也不改写目标数据库。
